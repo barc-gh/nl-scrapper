@@ -13,36 +13,27 @@ CATALOG_URL = "https://www.national-lottery.co.uk/scratchcards/all-scratchcards"
 
 
 def parse_pdf_procedures(pdf_url):
-  """Downloads the Game Procedures PDF in memory and extracts:
-
-  - Total cards printed (N)
-  - PDF creation date or server Last-Modified date
-  """
+  """Downloads procedures PDF in-memory to grab total printed (N) and upload date."""
   headers = {
       "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       )
   }
-
   release_date = None
   total_printed = None
 
   try:
-    # 1. Check HTTP Last-Modified header
     head_resp = requests.head(pdf_url, headers=headers, timeout=10)
     if "Last-Modified" in head_resp.headers:
       dt = parsedate_to_datetime(head_resp.headers["Last-Modified"])
       release_date = dt.strftime("%Y-%m-%d")
 
-    # 2. Download PDF content into memory
     get_resp = requests.get(pdf_url, headers=headers, timeout=15)
     get_resp.raise_for_status()
 
     pdf_stream = io.BytesIO(get_resp.content)
     reader = PdfReader(pdf_stream)
 
-    # If HTTP header wasn't found, try embedded PDF CreationDate metadata
     if not release_date and reader.metadata:
       raw_meta_date = reader.metadata.get("/CreationDate") or reader.metadata.get(
           "/ModDate"
@@ -54,12 +45,10 @@ def parse_pdf_procedures(pdf_url):
               f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
           )
 
-    # 3. Extract total printed from the text layer
     full_text = ""
     for page in reader.pages:
       full_text += page.extract_text() or ""
 
-    # Regex search: "There are X,XXX,XXX Scratchcards in the initial print run"
     print_run_match = re.search(
         r"([\d,]+)\s+Scratchcards\s+in\s+the\s+initial\s+print\s+run",
         full_text,
@@ -69,7 +58,7 @@ def parse_pdf_procedures(pdf_url):
       total_printed = int(print_run_match.group(1).replace(",", ""))
 
   except Exception as e:
-    print(f"  [!] Error parsing PDF ({pdf_url}): {e}")
+    print(f"    [!] PDF parse error for {pdf_url}: {e}")
 
   return total_printed, release_date
 
@@ -81,42 +70,32 @@ def calculate_stats(
     release_date_str,
     expected_lifecycle=240,
 ):
-  """Computes estimated cards left, current odds, and advantage ratio."""
   if not printed or not jackpots_init or jackpots_init <= 0:
     return None, None, None
 
-  # 1. Days elapsed calculation
   days_elapsed = None
-  if release_date_str:
+  if release_date_str and release_date_str != "N/A":
     try:
       rel_date = datetime.strptime(release_date_str, "%Y-%m-%d")
       days_elapsed = max(
           0, (datetime.now(timezone.utc).replace(tzinfo=None) - rel_date).days
       )
-    except ValueError:
+    except Exception:
       pass
 
-  # 2. Estimate cards remaining (Blended Depletion Model)
   if days_elapsed is not None:
-    # Blend time decay (60%) and jackpot claims (40%)
-    time_decay_factor = max(0.05, 1.0 - (days_elapsed / expected_lifecycle))
-    jackpot_factor = jackpots_left / jackpots_init
-    blended_factor = (0.6 * time_decay_factor) + (0.4 * jackpot_factor)
-    est_remaining = int(printed * blended_factor)
+    time_decay = max(0.05, 1.0 - (days_elapsed / expected_lifecycle))
+    jackpot_ratio = jackpots_left / jackpots_init
+    blended = (0.6 * time_decay) + (0.4 * jackpot_ratio)
+    est_remaining = int(printed * blended)
   else:
-    # Fallback to pure Maximum Likelihood Depletion
     claimed = jackpots_init - jackpots_left
     est_remaining = int(printed * (1.0 - (claimed / (jackpots_init + 1))))
 
-  # Ensure realistic bounds
   est_remaining = max(1000, min(printed, est_remaining))
-
-  # 3. Current 1-in-X Odds
   current_odds = (
       round(est_remaining / jackpots_left, 0) if jackpots_left > 0 else 0
   )
-
-  # 4. Advantage Ratio (R)
   base_odds = printed / jackpots_init
   advantage_ratio = (
       round(base_odds / current_odds, 3)
@@ -130,16 +109,16 @@ def calculate_stats(
 def run_scraper():
   print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Scraper...")
 
-  # Load existing CSV cache to avoid re-downloading existing PDFs
+  # Load previous CSV cache to avoid re-parsing existing PDFs
   cached_games = {}
   if os.path.exists(CSV_FILE):
     try:
       prev_df = pd.read_csv(CSV_FILE)
       for _, row in prev_df.iterrows():
         cached_games[str(row.get("game_id"))] = row.to_dict()
-      print(f"Loaded {len(cached_games)} cached games from {CSV_FILE}")
+      print(f"Loaded {len(cached_games)} cached games.")
     except Exception as e:
-      print(f"Could not load cache: {e}")
+      print(f"Cache load skipped: {e}")
 
   scraped_records = []
 
@@ -152,116 +131,133 @@ def run_scraper():
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        ),
+        viewport={"width": 1280, "height": 800},
     )
     page = context.new_page()
 
-    print(f"Navigating to {CATALOG_URL}...")
-    page.goto(CATALOG_URL, wait_until="networkidle", timeout=60000)
+    print(f"Opening {CATALOG_URL}...")
+    page.goto(CATALOG_URL, wait_until="domcontentloaded", timeout=60000)
 
-    # Select all scratchcard game cards on the catalog page
-    cards = page.locator("article, .card--scratchcard, [class*='card']").all()
-    print(f"Found {len(cards)} card elements on page.")
-
-    for card in cards:
-      card_text = card.inner_text()
-      if (
-          "top prizes left" not in card_text.lower()
-          and "procedures" not in card_text.lower()
-      ):
-        continue
-
-      # Extract Game Title & Game ID: e.g., "20X [1501]"
-      title_match = re.search(r"^(.*?)\s*(?:\[(\d+)\])?\s*$", card_text.split("\n")[0])
-      game_name = (
-          title_match.group(1).strip() if title_match else card_text.split("\n")[0]
+    # 1. Accept Cookie Consent if present
+    try:
+      cookie_btn = page.locator(
+          "#onetrust-accept-btn-handler, button:has-text('Accept All Cookies')"
       )
-      game_id_match = re.search(r"\[(\d{4})\]", card_text) or re.search(
-          r"GM(\d{4})", card_text
-      )
-      game_id = game_id_match.group(1) if game_id_match else "UNKNOWN"
+      if cookie_btn.count() > 0:
+        cookie_btn.first.click(timeout=5000)
+        print("Accepted cookie banner.")
+    except Exception:
+      pass
 
-      # Extract Price (£)
-      price_match = re.search(r"£(\d+(?:\.\d{2})?)\s+to play", card_text)
-      price = float(price_match.group(1)) if price_match else 0.0
-
-      # Extract Top Prize
-      jackpot_match = re.search(r"Win up to £([\d,]+)", card_text)
-      top_prize_str = (
-          jackpot_match.group(1).replace(",", "") if jackpot_match else "0"
+    # 2. Wait for game cards to load on page
+    try:
+      page.wait_for_selector(
+          "text=top prizes left, text=Read procedures", timeout=30000
       )
-      top_prize = int(top_prize_str)
+      print("Game cards loaded successfully.")
+    except Exception as e:
+      print(f"Timeout waiting for elements: {e}")
 
-      # Extract Remaining / Total Top Prizes (e.g. "3/4 top prizes left")
-      prizes_left_match = re.search(
-          r"(\d+)\s*/\s*(\d+)\s+top prizes left", card_text
-      )
-      jackpots_left = (
-          int(prizes_left_match.group(1)) if prizes_left_match else 0
-      )
-      jackpots_init = (
-          int(prizes_left_match.group(2)) if prizes_left_match else 0
-      )
+    # 3. Locate all "Read procedures" links and traverse up to their card containers
+    proc_links = page.locator(
+        "a:has-text('Read procedures'), a:has-text('procedures')"
+    ).all()
+    print(f"Found {len(proc_links)} scratchcard links.")
 
-      # Extract Game Procedures PDF link
-      proc_elem = card.locator("a:has-text('procedures'), a[href*='.pdf']")
-      proc_href = (
-          proc_elem.get_attribute("href") if proc_elem.count() > 0 else ""
-      )
-      if proc_href and not proc_href.startswith("http"):
-        proc_href = "https://www.national-lottery.co.uk" + proc_href
+    for link in proc_links:
+      try:
+        # Get the container card (closest enclosing card box)
+        card = link.locator("xpath=ancestor::div[contains(@class, 'card') or contains(@class, 'tile') or count(.//a) <= 3][last()]")
+        card_text = (
+            card.inner_text() if card.count() > 0 else link.locator("xpath=..").inner_text()
+        )
+        proc_href = link.get_attribute("href") or ""
+        if proc_href and not proc_href.startswith("http"):
+          proc_href = "https://www.national-lottery.co.uk" + proc_href
 
-      print(
-          f"Processing: {game_name} [ID: {game_id}] | Jackpots:"
-          f" {jackpots_left}/{jackpots_init}"
-      )
+        # Extract Game Title & Game ID (e.g., "20X [1501]")
+        lines = [line.strip() for line in card_text.split("\n") if line.strip()]
+        first_line = lines[0] if lines else "Unknown"
 
-      # Look up static values from cache or fetch from PDF
-      cached = cached_games.get(str(game_id), {})
-      total_printed = cached.get("total_printed")
-      release_date = cached.get("release_date")
+        game_id_match = re.search(r"\[(\d{4})\]", card_text) or re.search(
+            r"GM(\d{4})", card_text
+        ) or re.search(r"game-(\d{4})", proc_href)
+        game_id = game_id_match.group(1) if game_id_match else "UNKNOWN"
 
-      if not total_printed and proc_href:
-        print(f"  --> Downloading & parsing new PDF for Game {game_id}...")
-        parsed_n, parsed_date = parse_pdf_procedures(proc_href)
-        total_printed = parsed_n
-        release_date = (
-            parsed_date
-            or release_date
-            or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        game_name = re.sub(r"\s*\[\d+\]", "", first_line).strip()
+
+        # Extract Price (£)
+        price_match = re.search(r"£(\d+(?:\.\d{2})?)\s+to\s+play", card_text, re.IGNORECASE)
+        price = float(price_match.group(1)) if price_match else 0.0
+
+        # Extract Top Prize
+        jackpot_match = re.search(r"Win\s+up\s+to\s+£([\d,]+)", card_text, re.IGNORECASE)
+        top_prize = (
+            int(jackpot_match.group(1).replace(",", "")) if jackpot_match else 0
         )
 
-      # Statistical Computations
-      est_left, odds_now, edge_ratio = calculate_stats(
-          total_printed, jackpots_init, jackpots_left, release_date
-      )
+        # Extract Jackpots Left & Initial (e.g. "3/4 top prizes left")
+        prizes_match = re.search(
+            r"(\d+)\s*/\s*(\d+)\s+top\s+prizes\s+left", card_text, re.IGNORECASE
+        )
+        jackpots_left = int(prizes_match.group(1)) if prizes_match else 0
+        jackpots_init = int(prizes_match.group(2)) if prizes_match else 0
 
-      scraped_records.append({
-          "game_id": game_id,
-          "game_name": game_name,
-          "price": price,
-          "top_prize": top_prize,
-          "jackpots_left": jackpots_left,
-          "jackpots_initial": jackpots_init,
-          "total_printed": total_printed if total_printed else "N/A",
-          "release_date": release_date if release_date else "N/A",
-          "est_cards_left": est_left if est_left else "N/A",
-          "odds_1_in": odds_now if odds_now else "N/A",
-          "advantage_ratio": edge_ratio if edge_ratio else "N/A",
-          "procedures_url": proc_href,
-          "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-      })
+        print(
+            f"Parsed: {game_name} [ID: {game_id}] | Jackpots:"
+            f" {jackpots_left}/{jackpots_init}"
+        )
+
+        # Cache check or download PDF
+        cached = cached_games.get(str(game_id), {})
+        total_printed = cached.get("total_printed")
+        release_date = cached.get("release_date")
+
+        if (not total_printed or str(total_printed) == "nan") and proc_href:
+          print(f"  --> Downloading Game Procedures for ID {game_id}...")
+          parsed_n, parsed_date = parse_pdf_procedures(proc_href)
+          total_printed = parsed_n
+          release_date = parsed_date or release_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        est_left, odds_now, edge_ratio = calculate_stats(
+            total_printed, jackpots_init, jackpots_left, release_date
+        )
+
+        scraped_records.append({
+            "game_id": game_id,
+            "game_name": game_name,
+            "price": price,
+            "top_prize": top_prize,
+            "jackpots_left": jackpots_left,
+            "jackpots_initial": jackpots_init,
+            "total_printed": total_printed if total_printed else "N/A",
+            "release_date": release_date if release_date else "N/A",
+            "est_cards_left": est_left if est_left else "N/A",
+            "odds_1_in": odds_now if odds_now else "N/A",
+            "advantage_ratio": edge_ratio if edge_ratio else "N/A",
+            "procedures_url": proc_href,
+            "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        })
+
+      except Exception as err:
+        print(f"  [!] Error parsing card element: {err}")
 
     browser.close()
 
-  # Write back to CSV
+  # Always write CSV (guarantees Git never encounters missing file error)
   if scraped_records:
     df = pd.DataFrame(scraped_records)
-    # Sort with highest advantage ratio first
-    df.to_csv(CSV_FILE, index=False)
-    print(f"\n[✓] Successfully written {len(df)} games to {CSV_FILE}")
   else:
-    print("\n[!] No records were extracted. Check website structure.")
+    print("\n[!] Warning: No records found. Generating empty template.")
+    df = pd.DataFrame(columns=[
+        "game_id", "game_name", "price", "top_prize", "jackpots_left",
+        "jackpots_initial", "total_printed", "release_date", "est_cards_left",
+        "odds_1_in", "advantage_ratio", "procedures_url", "last_updated"
+    ])
+
+  df.to_csv(CSV_FILE, index=False)
+  print(f"[✓] Successfully saved {len(df)} records to {CSV_FILE}")
 
 
 if __name__ == "__main__":
