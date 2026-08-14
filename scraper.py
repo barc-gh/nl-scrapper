@@ -51,7 +51,7 @@ def parse_pdf_procedures(pdf_url):
     for page in reader.pages:
       full_text += page.extract_text() or ""
 
-    # Extract Game Name: e.g. Game Name: "20X"
+    # Extract Game Name
     name_m = re.search(
         r"Game\s+Name:\s*[“\"״]([^”\"״\n\r]+)[”\"״]", full_text, re.IGNORECASE
     )
@@ -60,7 +60,7 @@ def parse_pdf_procedures(pdf_url):
     if name_m:
       pdf_game_name = name_m.group(1).strip(" “\"״\t")
 
-    # Extract Game ID: e.g. Game Number: "Game 1501"
+    # Extract Game ID
     num_m = re.search(
         r"Game\s+Number:\s*[“\"״]?Game\s*(\d+)[”\"״]?",
         full_text,
@@ -69,7 +69,7 @@ def parse_pdf_procedures(pdf_url):
     if num_m:
       pdf_game_id = num_m.group(1).strip()
 
-    # Extract Total Printed: e.g. "12,633,840 Scratchcards in the initial print run"
+    # Extract Total Printed
     print_m = re.search(
         r"([\d,]+)\s+Scratchcards\s+in\s+the\s+initial\s+print\s+run",
         full_text,
@@ -91,8 +91,9 @@ def calculate_stats(
     release_date_str,
     expected_lifecycle=240,
 ):
+  """Computes estimated cards left, current odds, and advantage ratio."""
   if not printed or not jackpots_init or jackpots_init <= 0:
-    return None, None, None
+    return "N/A", "N/A", "N/A"
 
   days_elapsed = None
   if release_date_str and release_date_str != "N/A":
@@ -114,15 +115,14 @@ def calculate_stats(
     est_remaining = int(printed * (1.0 - (claimed / (jackpots_init + 1))))
 
   est_remaining = max(1000, min(printed, est_remaining))
-  current_odds = (
-      round(est_remaining / jackpots_left, 0) if jackpots_left > 0 else 0
-  )
-  base_odds = printed / jackpots_init
-  advantage_ratio = (
-      round(base_odds / current_odds, 3)
-      if current_odds and current_odds > 0
-      else 0.0
-  )
+
+  if jackpots_left > 0:
+    current_odds = round(est_remaining / jackpots_left, 0)
+    base_odds = printed / jackpots_init
+    advantage_ratio = round(base_odds / current_odds, 3)
+  else:
+    current_odds = "No Top Prizes"
+    advantage_ratio = 0.0
 
   return est_remaining, current_odds, advantage_ratio
 
@@ -135,17 +135,10 @@ def run_scraper():
     try:
       prev_df = pd.read_csv(CSV_FILE)
       for _, row in prev_df.iterrows():
-        # Only cache if valid name and id exist
-        g_name = str(row.get("game_name"))
-        g_id = str(row.get("game_id"))
-        if (
-            g_name
-            and g_name != "Unknown"
-            and g_id != "UNKNOWN"
-            and pd.notna(row.get("total_printed"))
-        ):
-          cached_games[str(row.get("procedures_url"))] = row.to_dict()
-      print(f"Loaded {len(cached_games)} valid cached games.")
+        url = str(row.get("procedures_url"))
+        if url and pd.notna(row.get("total_printed")):
+          cached_games[url] = row.to_dict()
+      print(f"Loaded {len(cached_games)} cached games.")
     except Exception as e:
       print(f"Cache load skipped: {e}")
 
@@ -168,7 +161,7 @@ def run_scraper():
     print(f"Opening {CATALOG_URL}...")
     page.goto(CATALOG_URL, wait_until="domcontentloaded", timeout=60000)
 
-    # Accept cookie banner
+    # 1. Accept Cookie Banner
     try:
       cookie_btn = page.locator(
           "#onetrust-accept-btn-handler, button:has-text('Accept All Cookies')"
@@ -178,7 +171,7 @@ def run_scraper():
     except Exception:
       pass
 
-    # Wait for scratchcards to render
+    # 2. Wait for Scratchcards
     try:
       page.wait_for_selector(
           "text=top prizes left, text=Read procedures", timeout=30000
@@ -186,6 +179,7 @@ def run_scraper():
     except Exception as e:
       print(f"Timeout waiting for elements: {e}")
 
+    # 3. Locate all procedure links
     proc_links = page.locator(
         "a:has-text('Read procedures'), a:has-text('procedures')"
     ).all()
@@ -199,29 +193,35 @@ def run_scraper():
         if not proc_href.startswith("http"):
           proc_href = "https://www.national-lottery.co.uk" + proc_href
 
-        # Locate enclosing card container
-        card = link.locator(
-            "xpath=ancestor::*[contains(., 'to play') and contains(., 'top"
-            " prizes left')][last()]"
-        )
+        # Select the nearest enclosing card tile container [1]
+        card = link.locator("xpath=ancestor::*[contains(., 'to play')][1]")
         if card.count() == 0:
-          card = link.locator("xpath=ancestor::article[1]")
-        if card.count() == 0:
-          card = link.locator("xpath=ancestor::div[count(.//a) <= 3][1]")
+          card = link.locator(
+              "xpath=ancestor::*[contains(., 'top prizes left')][1]"
+          )
 
         card_text = card.inner_text()
 
-        # HTML Headings for Title
-        heading_elem = card.locator("h2, h3, h4, [class*='title']").first
-        html_title = heading_elem.inner_text() if heading_elem.count() > 0 else ""
+        # Extract Card Title from the tile header
+        lines = [line.strip() for line in card_text.split("\n") if line.strip()]
+        first_line = lines[0] if lines else "Unknown"
+        game_name = re.sub(r"\s*\[\d+\].*$", "", first_line).strip()
 
-        # Price (£)
+        # Extract Game ID (e.g. [1501])
+        id_match = (
+            re.search(r"\[(\d{4})\]", card_text)
+            or re.search(r"GM(\d{4})", card_text)
+            or re.search(r"game-(\d{4})", proc_href)
+        )
+        game_id = id_match.group(1) if id_match else "UNKNOWN"
+
+        # Extract Price (£)
         price_match = re.search(
             r"£(\d+(?:\.\d{2})?)\s+to\s+play", card_text, re.IGNORECASE
         )
         price = float(price_match.group(1)) if price_match else 0.0
 
-        # Top Prize (£)
+        # Extract Top Prize (£)
         jackpot_match = re.search(
             r"Win\s+up\s+to\s+£([\d,]+)", card_text, re.IGNORECASE
         )
@@ -231,7 +231,7 @@ def run_scraper():
             else 0
         )
 
-        # Jackpots Left / Initial
+        # Extract Jackpots Left vs Initial
         prizes_match = re.search(
             r"(\d+)\s*/\s*(\d+)\s+top\s+prizes\s+left",
             card_text,
@@ -240,27 +240,20 @@ def run_scraper():
         jackpots_left = int(prizes_match.group(1)) if prizes_match else 0
         jackpots_init = int(prizes_match.group(2)) if prizes_match else 0
 
-        # Cache or Download PDF
+        # PDF lookup or download
         cached = cached_games.get(proc_href, {})
-        game_name = cached.get("game_name")
-        game_id = cached.get("game_id")
         total_printed = cached.get("total_printed")
         release_date = cached.get("release_date")
 
-        if not game_name or not total_printed or str(total_printed) == "nan":
-          print(f"  --> Downloading & extracting PDF: {proc_href}")
+        if not total_printed or str(total_printed) == "nan":
+          print(f"  --> Downloading Procedures PDF: {proc_href}")
           pdf_name, pdf_id, parsed_n, parsed_date = parse_pdf_procedures(
               proc_href
           )
-          game_name = pdf_name or html_title or "Unknown"
-          game_id = (
-              pdf_id
-              or (
-                  re.search(r"\[(\d{4})\]", html_title).group(1)
-                  if re.search(r"\[(\d{4})\]", html_title)
-                  else "UNKNOWN"
-              )
-          )
+          if game_name == "Unknown" and pdf_name:
+            game_name = pdf_name
+          if game_id == "UNKNOWN" and pdf_id:
+            game_id = pdf_id
           total_printed = parsed_n
           release_date = (
               parsed_date
@@ -273,8 +266,9 @@ def run_scraper():
         )
 
         print(
-            f"Parsed: {game_name} [ID: {game_id}] | £{price} | Ratio:"
-            f" {edge_ratio}"
+            f"Parsed: {game_name:20} [ID: {game_id}] | £{price:4.2f} | Top:"
+            f" £{top_prize:9,d} | Jackpots: {jackpots_left}/{jackpots_init} |"
+            f" Ratio: {edge_ratio}"
         )
 
         scraped_records.append({
@@ -286,9 +280,9 @@ def run_scraper():
             "jackpots_initial": jackpots_init,
             "total_printed": total_printed if total_printed else "N/A",
             "release_date": release_date if release_date else "N/A",
-            "est_cards_left": est_left if est_left else "N/A",
-            "odds_1_in": odds_now if odds_now else "N/A",
-            "advantage_ratio": edge_ratio if edge_ratio else "N/A",
+            "est_cards_left": est_left,
+            "odds_1_in": odds_now,
+            "advantage_ratio": edge_ratio,
             "procedures_url": proc_href,
             "last_updated": (
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -302,9 +296,12 @@ def run_scraper():
 
   if scraped_records:
     df = pd.DataFrame(scraped_records)
-    # Deduplicate by procedures_url if any duplicates exist
     df = df.drop_duplicates(subset=["procedures_url"])
-    df = df.sort_values(by="advantage_ratio", ascending=False)
+    # Sort by Advantage Ratio descending
+    df["sort_key"] = pd.to_numeric(df["advantage_ratio"], errors="coerce")
+    df = df.sort_values(by="sort_key", ascending=False).drop(
+        columns=["sort_key"]
+    )
   else:
     df = pd.DataFrame(
         columns=[
@@ -325,7 +322,7 @@ def run_scraper():
     )
 
   df.to_csv(CSV_FILE, index=False)
-  print(f"[✓] Successfully saved {len(df)} distinct records to {CSV_FILE}")
+  print(f"\n[✓] Successfully saved {len(df)} distinct scratchcards to {CSV_FILE}")
 
 
 if __name__ == "__main__":
